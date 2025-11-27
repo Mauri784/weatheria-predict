@@ -1,3 +1,5 @@
+from flask import Flask, jsonify, send_file
+from flask_cors import CORS
 import requests
 import json
 import os
@@ -10,14 +12,18 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.dummy import DummyClassifier
+import threading
 
-API_KEY = "185b46c637e9436e80525120250811"
+app = Flask(__name__)
+CORS(app)
+
+API_KEY = os.environ.get("WEATHER_API_KEY", "185b46c637e9436e80525120250811")
 CIUDAD = "20.5888,-100.3899"  # Coordenadas de Querétaro
 MODEL_FILE = "modelo_lluvia.pkl"
 DATA_FILE = "historico_clima.json"
 OUTPUT_FILE = "pronostico_lluvia_queretaro.json"
 
-# --- FUNCIONES AUXILIARES ---
+# --- FUNCIONES AUXILIARES (SIN CAMBIOS) ---
 
 def generar_historico(ciudad):
     print("Generando histórico climático de los últimos 60 días...\n")
@@ -45,12 +51,12 @@ def generar_historico(ciudad):
 
     df = pd.DataFrame(historico)
     df.to_json(DATA_FILE, orient="records", indent=4)
-    print(f" Archivo '{DATA_FILE}' generado con {len(historico)} días de datos.\n")
+    print(f"Archivo '{DATA_FILE}' generado con {len(historico)} días de datos.\n")
     return df
 
 
 def obtener_datos_climaticos(ciudad):
-    print(f" Obteniendo datos actuales de {ciudad}...\n")
+    print(f"Obteniendo datos actuales de {ciudad}...\n")
     url = f"https://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q={ciudad}&days=5&aqi=no&alerts=no"
     resp = requests.get(url)
     data = resp.json()
@@ -73,7 +79,7 @@ def obtener_datos_climaticos(ciudad):
 
 
 def entrenar_modelo(df):
-    print(" Entrenando modelo de predicción de lluvia...\n")
+    print("Entrenando modelo de predicción de lluvia...\n")
     features = ["temp", "viento", "humedad", "presion", "nubosidad", "lluvia_total"]
     df["llovera"] = (df["lluvia_total"] > 1).astype(int)
 
@@ -81,7 +87,7 @@ def entrenar_modelo(df):
     y = df["llovera"]
 
     if len(y.unique()) < 2:
-        print(" Solo hay una clase (ej. no llovió). Se generará modelo constante.\n")
+        print("Solo hay una clase (ej. no llovió). Se generará modelo constante.\n")
 
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
@@ -102,7 +108,7 @@ def entrenar_modelo(df):
 
     pred = modelo.predict(X_test_scaled)
     acc = accuracy_score(y_test, pred)
-    print(f" Precisión del modelo: {acc*100:.2f}%\n")
+    print(f"Precisión del modelo: {acc*100:.2f}%\n")
 
     joblib.dump({"modelo": modelo, "scaler": scaler}, MODEL_FILE)
     return modelo, scaler
@@ -110,11 +116,11 @@ def entrenar_modelo(df):
 
 def cargar_modelo():
     if os.path.exists(MODEL_FILE):
-        print(" Cargando modelo existente...\n")
+        print("Cargando modelo existente...\n")
         data = joblib.load(MODEL_FILE)
         return data["modelo"], data["scaler"]
     else:
-        print(" No se encontró modelo. Entrenando uno nuevo...\n")
+        print("No se encontró modelo. Entrenando uno nuevo...\n")
         if not os.path.exists(DATA_FILE):
             df = generar_historico(CIUDAD)
         else:
@@ -130,7 +136,7 @@ def generar_pronostico():
     weather_data = obtener_datos_climaticos(CIUDAD)
     modelo, scaler = cargar_modelo()
 
-    print("\n Obteniendo pronóstico de los próximos 5 días...\n")
+    print("\nObteniendo pronóstico de los próximos 5 días...\n")
     predicciones = []
 
     for fecha, datos_dia in weather_data.items():
@@ -150,7 +156,7 @@ def generar_pronostico():
             }
             predicciones.append(resultado)
 
-            estado = "🌧️ Lloverá" if prediccion else "No lloverá"
+            estado = "🌧️ Lloverá" if prediccion else "☀️ No lloverá"
             print(f"{fecha}: {estado} (Condición: {datos_dia['condicion']}, Prob. API: {datos_dia['prob_lluvia']}%)")
 
         except Exception as e:
@@ -162,9 +168,70 @@ def generar_pronostico():
     print(f"\nArchivo '{OUTPUT_FILE}' generado con éxito.\n")
 
 
-# --- CICLO AUTOMÁTICO CADA 12 HORAS ---
-if __name__ == "__main__":
-    while True:
+# --- ENDPOINTS PARA QUE FUNCIONE COMO WEB SERVICE ---
+
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'ok',
+        'message': 'API de predicción meteorológica funcionando',
+        'ultima_actualizacion': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+
+@app.route('/pronostico', methods=['GET'])
+def obtener_pronostico():
+    """Obtener el pronóstico actual (el archivo JSON generado)"""
+    try:
+        if os.path.exists(OUTPUT_FILE):
+            with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return jsonify({
+                'status': 'success',
+                'data': data
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'No hay pronóstico disponible. El servicio se está iniciando...'
+            }), 404
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/actualizar', methods=['GET'])
+def forzar_actualizacion():
+    """Endpoint para forzar una actualización manual del pronóstico"""
+    try:
         generar_pronostico()
-        print("⏳ Esperando 12 horas para la siguiente actualización...\n")
-        time.sleep(43200)  # 12 horas (en segundos)
+        return jsonify({
+            'status': 'success',
+            'message': 'Pronóstico actualizado correctamente'
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+# --- GENERAR PRONÓSTICO AL INICIAR ---
+def inicializar():
+    """Se ejecuta una vez al iniciar el servidor"""
+    print("🚀 Iniciando servidor de pronóstico meteorológico...")
+    try:
+        generar_pronostico()
+        print("✅ Pronóstico inicial generado correctamente")
+    except Exception as e:
+        print(f"❌ Error al generar pronóstico inicial: {e}")
+
+
+if __name__ == '__main__':
+    # Generar el pronóstico inicial en un hilo separado
+    threading.Thread(target=inicializar, daemon=True).start()
+    
+    # Iniciar el servidor Flask
+    app.run(host='0.0.0.0', port=5002, debug=False)
