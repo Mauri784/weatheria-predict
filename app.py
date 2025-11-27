@@ -1,24 +1,34 @@
+from flask import Flask, jsonify
+from flask_cors import CORS
 import requests
 import json
 import os
-import time
 import joblib
 import pandas as pd
 from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 from sklearn.dummy import DummyClassifier
+import threading
+import time
 
+# ✅ CREAR LA APP FLASK
+app = Flask(__name__)
+CORS(app)
 
+# Variables
 API_KEY = "185b46c637e9436e80525120250811"
 CIUDAD = "20.5888,-100.3899"
 MODEL_FILE = "modelo_lluvia.pkl"
 DATA_FILE = "historico_clima.json"
-
 FIREBASE_URL = "https://weatheriadx-default-rtdb.firebaseio.com/"
 
+# Variable global para almacenar último pronóstico
+ultimo_pronostico = {
+    "predicciones": [],
+    "fecha_actualizacion": None
+}
 
 
 def generar_historico(ciudad):
@@ -119,7 +129,6 @@ def guardar_en_firebase(predicciones):
     }
 
     url = f"{FIREBASE_URL}/pronostico_queretaro.json"
-
     r = requests.put(url, json=payload)
 
     if r.status_code == 200:
@@ -128,48 +137,233 @@ def guardar_en_firebase(predicciones):
         print("Error enviando a Firebase:", r.text)
 
 
+def generar_pronostico_interno():
+    """Función interna para generar pronóstico"""
+    global ultimo_pronostico
+    
+    try:
+        print("\n============================")
+        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print("============================\n")
 
-def generar_pronostico():
-    print("\n============================")
-    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    print("============================\n")
+        weather_data = obtener_datos_climaticos(CIUDAD)
+        modelo, scaler = cargar_modelo()
 
-    weather_data = obtener_datos_climaticos(CIUDAD)
-    modelo, scaler = cargar_modelo()
+        predicciones = []
 
-    predicciones = []
+        for fecha, datos_dia in weather_data.items():
+            X_df = pd.DataFrame([[ 
+                datos_dia["temp"],
+                datos_dia["viento"],
+                datos_dia["humedad"],
+                datos_dia["presion"],
+                datos_dia["nubosidad"],
+                datos_dia["lluvia_total"]
+            ]], columns=["temp","viento","humedad","presion","nubosidad","lluvia_total"])
 
-    for fecha, datos_dia in weather_data.items():
-        X_df = pd.DataFrame([[ 
-            datos_dia["temp"],
-            datos_dia["viento"],
-            datos_dia["humedad"],
-            datos_dia["presion"],
-            datos_dia["nubosidad"],
-            datos_dia["lluvia_total"]
-        ]], columns=["temp","viento","humedad","presion","nubosidad","lluvia_total"])
+            x_scaled = scaler.transform(X_df)
+            prediccion = modelo.predict(x_scaled)[0]
 
-        x_scaled = scaler.transform(X_df)
-        prediccion = modelo.predict(x_scaled)[0]
+            resultado = {
+                "fecha": fecha,
+                "condicion": datos_dia["condicion"],
+                "temperatura": datos_dia["temp"],
+                "humedad": datos_dia["humedad"],
+                "viento": datos_dia["viento"],
+                "presion": datos_dia["presion"],
+                "prob_lluvia_api": datos_dia["prob_lluvia"],
+                "llovera_modelo": bool(prediccion)
+            }
 
-        resultado = {
-            "fecha": fecha,
-            "condicion": datos_dia["condicion"],
-            "prob_lluvia_api": datos_dia["prob_lluvia"],
-            "llovera_modelo": bool(prediccion)
+            predicciones.append(resultado)
+
+            estado = "Lloverá" if prediccion else "No lloverá"
+            print(f"{fecha}: {estado}")
+
+        guardar_en_firebase(predicciones)
+        
+        # Actualizar variable global
+        ultimo_pronostico = {
+            "predicciones": predicciones,
+            "fecha_actualizacion": datetime.now().isoformat()
         }
-
-        predicciones.append(resultado)
-
-        estado = "Lloverá" if prediccion else "No lloverá"
-        print(f"{fecha}: {estado}")
-
-    guardar_en_firebase(predicciones)
-
+        
+        return True, predicciones
+        
+    except Exception as e:
+        print(f"Error generando pronóstico: {e}")
+        return False, None
 
 
-if __name__ == "__main__":
+def tarea_periodica():
+    """Tarea que se ejecuta cada 12 horas en background"""
     while True:
-        generar_pronostico()
+        generar_pronostico_interno()
         print("⏳ Esperando 12 horas...\n")
-        time.sleep(43200)
+        time.sleep(43200)  # 12 horas
+
+
+# ========== ENDPOINTS DE LA API ==========
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check del servicio"""
+    return jsonify({
+        'status': 'ok',
+        'message': 'API de predicción de lluvia funcionando',
+        'ciudad': CIUDAD,
+        'ultima_actualizacion': ultimo_pronostico.get('fecha_actualizacion'),
+        'total_predicciones': len(ultimo_pronostico.get('predicciones', []))
+    })
+
+
+@app.route('/pronostico', methods=['GET'])
+def obtener_pronostico():
+    """Obtener el pronóstico más reciente (sin regenerar)"""
+    try:
+        if ultimo_pronostico.get('predicciones'):
+            return jsonify({
+                'status': 'success',
+                'ciudad': CIUDAD,
+                'fecha_actualizacion': ultimo_pronostico['fecha_actualizacion'],
+                'predicciones': ultimo_pronostico['predicciones']
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'No hay pronósticos disponibles. Use /actualizar para generar uno.'
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/actualizar', methods=['GET', 'POST'])
+def actualizar_pronostico():
+    """Forzar la generación de un nuevo pronóstico"""
+    try:
+        exito, predicciones = generar_pronostico_interno()
+        
+        if exito:
+            return jsonify({
+                'status': 'success',
+                'message': 'Pronóstico actualizado correctamente',
+                'ciudad': CIUDAD,
+                'fecha_actualizacion': datetime.now().isoformat(),
+                'predicciones': predicciones
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'No se pudo generar el pronóstico'
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/entrenar', methods=['POST'])
+def entrenar_modelo_endpoint():
+    """Forzar el reentrenamiento del modelo con datos históricos"""
+    try:
+        df = generar_historico(CIUDAD)
+        modelo, scaler = entrenar_modelo(df)
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Modelo reentrenado correctamente',
+            'registros_utilizados': len(df),
+            'fecha': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/historico', methods=['GET'])
+def obtener_historico():
+    """Obtener el histórico climático utilizado para entrenar"""
+    try:
+        if os.path.exists(DATA_FILE):
+            df = pd.read_json(DATA_FILE)
+            return jsonify({
+                'status': 'success',
+                'total': len(df),
+                'data': df.to_dict(orient='records')
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'No hay datos históricos disponibles'
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/modelo/info', methods=['GET'])
+def info_modelo():
+    """Información sobre el modelo actual"""
+    try:
+        modelo_existe = os.path.exists(MODEL_FILE)
+        historico_existe = os.path.exists(DATA_FILE)
+        
+        info = {
+            'status': 'success',
+            'modelo_entrenado': modelo_existe,
+            'historico_disponible': historico_existe,
+            'ciudad': CIUDAD
+        }
+        
+        if historico_existe:
+            df = pd.read_json(DATA_FILE)
+            info['registros_historicos'] = len(df)
+            info['fecha_mas_antigua'] = df['fecha'].min()
+            info['fecha_mas_reciente'] = df['fecha'].max()
+        
+        return jsonify(info)
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+def inicializar():
+    """Se ejecuta al iniciar el servidor"""
+    print("🤖 Inicializando API de predicción de lluvia...")
+    
+    try:
+        # Cargar o crear modelo
+        cargar_modelo()
+        print("✅ Modelo cargado correctamente")
+        
+        # Generar primer pronóstico
+        generar_pronostico_interno()
+        print("✅ Primer pronóstico generado")
+        
+        # Iniciar tarea periódica en background
+        hilo = threading.Thread(target=tarea_periodica, daemon=True)
+        hilo.start()
+        print("✅ Tarea periódica iniciada (cada 12 horas)")
+        
+    except Exception as e:
+        print(f"⚠️ Error en inicialización: {e}")
+
+
+if __name__ == '__main__':
+    inicializar()
+    app.run(host='0.0.0.0', port=5000, debug=False)
